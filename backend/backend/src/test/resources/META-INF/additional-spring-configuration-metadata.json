@@ -1,0 +1,19 @@
+{
+    "properties": [
+        {
+            "name": "app.upload.dir",
+            "type": "java.lang.String",
+            "description": "Upload directory for files."
+        },
+        {
+            "name": "app.cors.allowed-origins",
+            "type": "java.lang.String",
+            "description": "Allowed origins for CORS."
+        },
+        {
+            "name": "app.oauth2.redirect-uri",
+            "type": "java.lang.String",
+            "description": "Redirect URI for OAuth2 after login."
+        }
+    ]
+}
