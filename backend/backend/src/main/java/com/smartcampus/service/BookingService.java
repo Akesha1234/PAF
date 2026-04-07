@@ -11,51 +11,75 @@ import com.smartcampus.repository.BookingRepository;
 import com.smartcampus.repository.ResourceRepository;
 import com.smartcampus.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.DayOfWeek;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 @SuppressWarnings("null")
 public class BookingService {
+
+    private static final int MAX_ACTIVE_BOOKINGS = 5;
 
     private final BookingRepository bookingRepository;
     private final ResourceRepository resourceRepository;
     private final UserRepository userRepository;
     private final NotificationService notificationService;
     private final QrCodeService qrCodeService;
+    private final EmailService emailService;
 
     @Transactional
     public BookingResponse createBooking(BookingRequest request, String userId) {
-        Resource resource = resourceRepository.findById(request.getResourceId())
+        log.info("Attempting to create booking for user {} on resource {}", userId, request.getResourceId());
+
+        // 1. Check user quota
+        long activeBookings = bookingRepository.countByUserIdAndStatusIn(userId, 
+                Arrays.asList(Booking.BookingStatus.PENDING, Booking.BookingStatus.APPROVED, Booking.BookingStatus.CHECKED_IN));
+        
+        if (activeBookings >= MAX_ACTIVE_BOOKINGS) {
+            throw new BusinessException("You have reached the maximum allowed active bookings (limit: " + MAX_ACTIVE_BOOKINGS + ")");
+        }
+
+        // 2. Fetch and LOCK the resource to prevent concurrent overlapping bookings
+        Resource resource = resourceRepository.findByIdWithLock(request.getResourceId())
                 .orElseThrow(() -> new ResourceNotFoundException("Resource", request.getResourceId()));
 
         if (resource.getStatus() != Resource.ResourceStatus.ACTIVE) {
-            throw new BusinessException("Resource '" + resource.getName() + "' is not available for booking (status: "
-                    + resource.getStatus() + ")");
+            throw new BusinessException("Resource '" + resource.getName() + "' is currently " + resource.getStatus() + " and unavailable.");
         }
 
-        if (request.getStartTime().isAfter(request.getEndTime()) ||
-                request.getStartTime().equals(request.getEndTime())) {
-            throw new BusinessException("Start time must be before end time");
+        // 3. Time range validation
+        if (request.getStartTime().isAfter(request.getEndTime()) || request.getStartTime().equals(request.getEndTime())) {
+            throw new BusinessException("Start time must be strictly before end time");
         }
+        
+        // 4. Advanced: Check availability windows (e.g. MON-FRI 08:00-18:00)
+        validateAvailabilityWindow(resource, request);
 
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
 
-        // Check for conflicts with existing approved bookings
+        // 5. Check for conflicts with existing approved bookings
         List<Booking> conflicts = bookingRepository.findConflictingBookings(
                 resource.getId(),
                 request.getDate(),
                 request.getStartTime(),
                 request.getEndTime(),
                 null);
+        
         if (!conflicts.isEmpty()) {
-            throw new ConflictException("Your requested time slot is already taken by an approved booking.");
+            throw new ConflictException("The requested time slot is no longer available.");
         }
 
         Booking booking = Booking.builder()
@@ -71,15 +95,73 @@ public class BookingService {
 
         Booking saved = bookingRepository.save(booking);
 
-        // Notify Admins of new booking activity
         notificationService.notifyAdmins(
                 "New Booking Request",
-                "User " + user.getName() + " has requested '" + resource.getName() + "' for " + request.getDate() + ".",
+                "User " + user.getName() + " requested '" + resource.getName() + "' for " + request.getDate() + ".",
                 Notification.NotificationType.GENERAL,
                 saved.getId(),
                 Notification.ReferenceType.BOOKING);
 
         return toResponse(saved);
+    }
+
+    private void validateAvailabilityWindow(Resource resource, BookingRequest request) {
+        String window = resource.getAvailabilityWindows();
+        if (window == null || window.trim().isEmpty()) return;
+
+        try {
+            // Simple format parsing for demo purposes: "MON-FRI 08:00-18:00"
+            String[] parts = window.split(" ");
+            if (parts.length < 2) return;
+
+            String daysPart = parts[0].toUpperCase();
+            String timePart = parts[1];
+
+            // Day Check
+            DayOfWeek bookingDay = request.getDate().getDayOfWeek();
+            boolean dayMatch = isDayInWindow(bookingDay, daysPart);
+            if (!dayMatch) {
+                throw new BusinessException("Resource is not available on " + bookingDay);
+            }
+
+            // Time Check
+            String[] times = timePart.split("-");
+            LocalTime windowStart = LocalTime.parse(times[0]);
+            LocalTime windowEnd = LocalTime.parse(times[1]);
+
+            if (request.getStartTime().isBefore(windowStart) || request.getEndTime().isAfter(windowEnd)) {
+                throw new BusinessException("Booking must be within operating hours: " + timePart);
+            }
+        } catch (Exception e) {
+            if (e instanceof BusinessException) throw (BusinessException) e;
+            log.warn("Failed to parse availability window for resource {}: {}", resource.getId(), window);
+        }
+    }
+
+    private boolean isDayInWindow(DayOfWeek day, String window) {
+        if (window.equals("EVERYDAY") || window.equals("ALL")) return true;
+        if (window.contains(day.name())) return true;
+        
+        if (window.contains("-")) {
+            String[] range = window.split("-");
+            DayOfWeek start = DayOfWeek.valueOf(expandDayName(range[0]));
+            DayOfWeek end = DayOfWeek.valueOf(expandDayName(range[1]));
+            return day.getValue() >= start.getValue() && day.getValue() <= end.getValue();
+        }
+        return false;
+    }
+
+    private String expandDayName(String shortName) {
+        return switch (shortName) {
+            case "MON" -> "MONDAY";
+            case "TUE" -> "TUESDAY";
+            case "WED" -> "WEDNESDAY";
+            case "THU" -> "THURSDAY";
+            case "FRI" -> "FRIDAY";
+            case "SAT" -> "SATURDAY";
+            case "SUN" -> "SUNDAY";
+            default -> shortName;
+        };
     }
 
     @Transactional(readOnly = true)
@@ -161,6 +243,17 @@ public class BookingService {
                         ? Notification.NotificationType.BOOKING_APPROVED
                         : Notification.NotificationType.BOOKING_REJECTED,
                 booking.getId(), Notification.ReferenceType.BOOKING);
+
+        // Send HTML Email
+        emailService.sendBookingStatusEmail(
+                booking.getUser().getEmail(),
+                booking.getUser().getName(),
+                booking.getResource().getName(),
+                newStatus.name(),
+                booking.getDate().toString(),
+                booking.getQrCode(),
+                request.getAdminNotes()
+        );
 
         return toResponse(saved);
     }
@@ -249,6 +342,44 @@ public class BookingService {
         // in the future
 
         return toResponse(bookingRepository.save(booking));
+    }
+
+    @Scheduled(fixedDelay = 600000) // Every 10 minutes
+    @Transactional
+    public void processExpiredBookings() {
+        log.info("Starting background check for expired bookings...");
+        LocalDate today = LocalDate.now();
+        LocalTime now = LocalTime.now();
+
+        // 1. Mark CHECKED_IN as COMPLETED if time passed
+        List<Booking> active = bookingRepository.findByStatus(Booking.BookingStatus.CHECKED_IN);
+        for (Booking b : active) {
+            if (b.getDate().isBefore(today) || (b.getDate().equals(today) && b.getEndTime().isBefore(now))) {
+                b.setStatus(Booking.BookingStatus.COMPLETED);
+                bookingRepository.save(b);
+                log.info("Auto-completed booking {}", b.getId());
+            }
+        }
+
+        // 2. Mark APPROVED (but not checked in) as MISSED if time passed
+        List<Booking> approved = bookingRepository.findByStatus(Booking.BookingStatus.APPROVED);
+        for (Booking b : approved) {
+            if (b.getDate().isBefore(today) || (b.getDate().equals(today) && b.getEndTime().isBefore(now))) {
+                b.setStatus(Booking.BookingStatus.MISSED);
+                bookingRepository.save(b);
+                log.info("Marked booking {} as MISSED", b.getId());
+                
+                // Notify user they missed it
+                notificationService.createNotification(
+                    b.getUser().getId(),
+                    "Booking Missed",
+                    "You did not check in for your booking of '" + b.getResource().getName() + "' today.",
+                    Notification.NotificationType.GENERAL,
+                    b.getId(),
+                    Notification.ReferenceType.BOOKING
+                );
+            }
+        }
     }
 
     private Booking findById(String id) {

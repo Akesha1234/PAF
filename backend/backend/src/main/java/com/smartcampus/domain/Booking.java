@@ -67,6 +67,6 @@ public class Booking {
     private String qrCode;
 
     public enum BookingStatus {
-        PENDING, APPROVED, REJECTED, CANCELLED, CHECKED_IN
+        PENDING, APPROVED, REJECTED, CANCELLED, CHECKED_IN, COMPLETED, MISSED
     }
 }

@@ -77,7 +77,7 @@ public class BookingController {
 
     /** POST /api/bookings/{id}/checkin - Admin scans QR code payload and checks in the booking */
     @PostMapping("/{id}/checkin")
-    @PreAuthorize("isAuthenticated()")
+    @PreAuthorize("hasAnyRole('ADMIN', 'STAFF')")
     public ResponseEntity<BookingResponse> checkin(@PathVariable("id") String id) {
         return ResponseEntity.ok(bookingService.checkIn(id));
     }
@@ -89,12 +89,10 @@ public class BookingController {
         return ResponseEntity.ok(bookingService.updateBooking(id, request, SecurityUtils.getCurrentUserId()));
     }
 
-    /** DELETE /api/bookings/{id} - Admin can delete any booking; Users can delete PENDING ones */
+    /** DELETE /api/bookings/{id} - Admin can delete any booking */
     @DeleteMapping("/{id}")
-    @PreAuthorize("isAuthenticated()")
+    @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<Void> delete(@PathVariable("id") String id) {
-        // Business logic for who can delete (Admins/Users) should be in the service
-        // but for now delete as-is
         bookingService.deleteBooking(id);
         return ResponseEntity.noContent().build();
     }
