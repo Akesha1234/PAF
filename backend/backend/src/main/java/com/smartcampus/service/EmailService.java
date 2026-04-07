@@ -14,6 +14,7 @@ import org.thymeleaf.context.Context;
 @Slf4j
 @Service
 @RequiredArgsConstructor
+@SuppressWarnings("null")
 public class EmailService {
 
     private final JavaMailSender mailSender;
